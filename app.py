@@ -374,3 +374,32 @@ st.markdown(
     f'<div class="stat-v">{plan["players_per_wave"]}</div></div>'
     f'<div class="stat-box"><div class="stat-k">Rally cycle</div>'
     f'<div class="stat-v">{format_time(plan["cycle_sec"])}</div></div>'
+    f'</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    '<div class="legend-box">'
+    '<b>Time left (L)</b> = in-game countdown (30:00 down to 00:00) &nbsp;|&nbsp; '
+    '<b>Time passed (P)</b> = elapsed since trap (00:00 up to 30:00) &nbsp;|&nbsp; '
+    'Each rally: Start → 5 min fill → Depart → Hit → Return'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f'<div class="section-head">Wave tables — {plan["wave_count"]} side by side</div>',
+    unsafe_allow_html=True,
+)
+
+cols = st.columns(plan["wave_count"])
+for idx, w in enumerate(plan["waves"][: plan["wave_count"]]):
+    render_wave_table(cols[idx], w)
+
+if plan["all_rallies"]:
+    bonus = bonus_cycles(travel_sec, gap_sec, plan["all_rallies"][0]["return_sec"])
+    if bonus:
+        with st.expander("Bonus: second rally cycle (if players return and restart)"):
+            st.dataframe(pd.DataFrame(bonus), use_container_width=True, hide_index=True)
+
+st.caption("King Shot Bear Trap Planner")
