@@ -1,62 +1,36 @@
-"""
-King Shot — Bear Trap Rally Planner (Streamlit)
 
-Deploy on Streamlit Community Cloud.
+"""
+King Shot — Bear Trap Rally Planner
+Author: Dr. D. #2041
+
 requirements.txt:
 streamlit
 pandas
 
-Model summary
--------------
-Fixed timing rules:
-- Bear Trap window is 30:00.
-- A rally stays open / fills for 5:00, then departs.
-- The last rally can be opened at 5:00 left, so it departs at the buzzer.
-- Troops are reused; they are not lost in Bear Trap.
-
-Wave logic:
-- A wave is a staggered rally slot, not a separate permanent group.
-- With W waves, a new launch opens every 5:00 / W seconds by default.
-- Players try to ride every launch. After their troops return, they join the next
-  part-filled rally before it departs.
-
-Hard logistics equations:
-1) Per-launch troop pool = players * troops_each_player_sends_per_launch.
-2) Rallies needed per launch must satisfy BOTH:
-   - total capacity constraint: rallies >= ceil(pool / rally_capacity)
-   - per-player march constraint: rallies >= ceil(troops_per_player / player_march_size)
-   Example: a player has 200K to send per launch and march size is 100K, so the
-   launch needs at least 2 rallies even if total rally capacity is large enough.
-3) Concurrent rallies open = waves * rallies_per_launch.
-   You need at least that many rally hosts/leaders available.
-4) Catch-next-wave constraint:
-   stagger >= 2 * bear_march_seconds + join_host_seconds + tap_buffer_seconds
-   If this is not true, players cannot reliably return and reach the next host
-   before the next rally departs.
+Main fix:
+For every hit, rallies opened = exact rallies needed, not all available hosts.
+Example: 10 players x 200K = 2,000K troop pool. Rally cap 500K => 4 rallies.
+If 2 waves split 10 hosts into 5 hosts per wave, the planner opens 4 rallies and leaves 1 host unused.
 """
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
-WINDOW = 30 * 60                  # 30:00 event window
-FILL = 5 * 60                     # rally fill/open time
-LAST_LAUNCH_OPEN = WINDOW - FILL  # elapsed 25:00 = 5:00 left
-WAVE_COLORS = ["#45c4ff", "#b78bff", "#4fe0a0", "#ffc061"]
+WINDOW = 30 * 60
+FILL = 5 * 60
+LAST_OPEN = WINDOW - FILL
 
-st.set_page_config(page_title="Bear Trap Rally Planner", page_icon="🐻", layout="wide")
+st.set_page_config(page_title="Bear Trap Rally Planner", page_icon="BT", layout="wide")
 
 
-# -----------------------------------------------------------------------------
-# Formatting helpers
-# -----------------------------------------------------------------------------
-
-def fmt_clock(seconds: float) -> str:
-    seconds = max(0, int(round(seconds)))
-    minutes, sec = divmod(seconds, 60)
-    return f"{minutes}:{sec:02d}"
+def fmt_clock(sec: float) -> str:
+    sec = max(0, int(round(sec)))
+    m, s = divmod(sec, 60)
+    return f"{m}:{s:02d}"
 
 
 def fmt_left(elapsed: float) -> str:
@@ -67,403 +41,329 @@ def fmt_troops(n: float) -> str:
     n = int(round(n))
     if n >= 1_000_000:
         v = n / 1_000_000
-        return (f"{v:.1f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}") + "M"
+        return (f"{v:.1f}" if v % 1 else f"{int(v)}") + "M"
     if n >= 1_000:
         v = n / 1_000
-        return (f"{v:.1f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}") + "K"
+        return (f"{v:.1f}" if v % 1 else f"{int(v)}") + "K"
     return f"{n:,}"
 
 
-def pct(n: float) -> str:
-    return f"{n:.0%}"
+def pct(x: float) -> str:
+    return f"{x:.0%}"
 
-
-# -----------------------------------------------------------------------------
-# Core model
-# -----------------------------------------------------------------------------
 
 @dataclass
 class Plan:
     players: int
     waves: int
-    troops_per_player: int
+    hosts_total: int
+    hosts_per_wave: int
+    troop_each: int
     march_size: int
     rally_cap: int
-    hosts_available: int
-    bear_march: int
-    join_host: int
-    tap_buffer: int
-    requested_stagger: float
+    pool: int
+    rallies_by_cap: int
+    rallies_by_march_size: int
+    rallies_per_hit: int
+    hosts_used_per_hit: int
+    unused_hosts_in_active_wave: int
+    active_wave_shortfall: int
     natural_stagger: float
+    requested_stagger: float
     min_stagger: float
     stagger: float
-    clamped: bool
-    pool_per_launch: int
-    rallies_by_capacity: int
-    rallies_by_march_size: int
-    rallies_per_launch: int
-    troops_per_player_per_rally: float
-    troops_per_rally: float
+    spacing_increased: bool
+    catch_buffer: float
+    overlapping_waves: int
+    peak_open_rallies: int
+    peak_host_shortfall: int
+    avg_per_rally: float
+    avg_player_per_rally: float
     fill_pct: float
-    concurrent_rallies: int
-    host_shortfall: int
-    feasible_hosts: bool
-    feasible_timing: bool
-    wait_after_join_logistics: float
     launches: list
-    total_launches: int
+    total_hits: int
     total_rallies: int
-    total_troops_sent: int
-    first_hit: float | None
-    last_hit: float | None
+    total_troops: int
 
 
 def compute_plan(
     players: int,
-    troops_per_player: int,
+    waves: int,
+    hosts_total: int,
+    troop_each: int,
     march_size: int,
     rally_cap: int,
-    hosts_available: int,
-    waves: int,
-    bear_march: int,
-    join_host: int,
+    march_to_bear: int,
+    reach_host: int,
     tap_buffer: int,
-    custom_stagger: float | None,
+    custom_stagger: Optional[float],
 ) -> Plan:
-    pool = players * troops_per_player
+    waves = max(1, min(4, waves))
+    hosts_per_wave = hosts_total // waves
+    pool = players * troop_each
 
-    # The new logistics requirement: rallies must satisfy both total rally cap
-    # and each player's individual march-size cap.
-    rallies_by_capacity = max(1, math.ceil(pool / rally_cap))
-    rallies_by_march_size = max(1, math.ceil(troops_per_player / march_size))
-    rallies_per_launch = max(rallies_by_capacity, rallies_by_march_size)
+    # Required equation 1: total troop pool must fit into rally capacity.
+    rallies_by_cap = max(1, math.ceil(pool / rally_cap))
 
-    troops_per_player_per_rally = troops_per_player / rallies_per_launch
-    troops_per_rally = pool / rallies_per_launch
-    fill_pct = troops_per_rally / rally_cap
+    # Required equation 2: each player cannot put more than march size into one rally.
+    rallies_by_march_size = max(1, math.ceil(troop_each / march_size))
 
-    natural = FILL / waves
-    requested = custom_stagger if custom_stagger is not None else natural
-    minimum = 2 * bear_march + join_host + tap_buffer
-    stagger = max(requested, minimum)
-    clamped = stagger > requested + 1e-9
+    # Final requirement: satisfy both equations. This avoids empty rallies.
+    rallies_per_hit = max(rallies_by_cap, rallies_by_march_size)
 
-    concurrent = waves * rallies_per_launch
-    host_shortfall = max(0, concurrent - hosts_available)
-    feasible_hosts = host_shortfall == 0
-    feasible_timing = requested >= minimum
-    wait_after_join = stagger - minimum
+    hosts_used_per_hit = min(rallies_per_hit, hosts_per_wave)
+    unused_hosts = max(0, hosts_per_wave - rallies_per_hit)
+    active_wave_shortfall = max(0, rallies_per_hit - hosts_per_wave)
+
+    natural_stagger = FILL / waves
+    requested_stagger = custom_stagger if custom_stagger is not None else natural_stagger
+    min_stagger = 2 * march_to_bear + reach_host + tap_buffer
+    stagger = max(requested_stagger, min_stagger)
+    spacing_increased = stagger > requested_stagger + 1e-9
+    catch_buffer = stagger - min_stagger
+
+    # Several wave slots can be filling at the same time because each rally remains open for 5:00.
+    overlapping_waves = min(waves, max(1, math.ceil(FILL / stagger)))
+    peak_open_rallies = overlapping_waves * rallies_per_hit
+    peak_host_shortfall = max(0, peak_open_rallies - hosts_total)
+
+    avg_per_rally = pool / rallies_per_hit
+    avg_player_per_rally = troop_each / rallies_per_hit
+    fill_pct = avg_per_rally / rally_cap
 
     launches = []
     i = 0
-    open_time = 0.0
-    while open_time <= LAST_LAUNCH_OPEN + 1e-9:
-        lane = i % waves
-        depart = open_time + FILL
-        hit = depart + bear_march
-        ret = hit + bear_march
-        launches.append(
-            {
-                "idx": i + 1,
-                "lane": lane,
-                "open": open_time,
-                "depart": depart,
-                "hit": hit,
-                "return": ret,
-                "final": abs(open_time - LAST_LAUNCH_OPEN) < 1e-6,
-                "rallies": rallies_per_launch,
-                "troops": pool,
-            }
-        )
+    open_t = 0.0
+    while open_t <= LAST_OPEN + 1e-9:
+        depart = open_t + FILL
+        hit = depart + march_to_bear
+        ret = hit + march_to_bear
+        launches.append({
+            "Hit #": i + 1,
+            "Wave": (i % waves) + 1,
+            "Open": fmt_left(open_t),
+            "Depart": fmt_left(depart),
+            "Hit": fmt_left(hit),
+            "Return": fmt_left(ret),
+            "Rallies opened": rallies_per_hit,
+            "Hosts used": hosts_used_per_hit,
+            "Unused hosts in wave": unused_hosts,
+            "Troops sent": fmt_troops(pool),
+            "Avg troops/rally": fmt_troops(avg_per_rally),
+            "Fill": pct(fill_pct),
+            "Final open": "Yes" if abs(open_t - LAST_OPEN) < 1e-9 else "",
+        })
         i += 1
-        open_time = i * stagger
-
-    total_launches = len(launches)
-    total_rallies = total_launches * rallies_per_launch
-    total_troops_sent = total_launches * pool
-    first_hit = launches[0]["hit"] if launches else None
-    last_hit = launches[-1]["hit"] if launches else None
+        open_t = i * stagger
 
     return Plan(
         players=players,
         waves=waves,
-        troops_per_player=troops_per_player,
+        hosts_total=hosts_total,
+        hosts_per_wave=hosts_per_wave,
+        troop_each=troop_each,
         march_size=march_size,
         rally_cap=rally_cap,
-        hosts_available=hosts_available,
-        bear_march=bear_march,
-        join_host=join_host,
-        tap_buffer=tap_buffer,
-        requested_stagger=requested,
-        natural_stagger=natural,
-        min_stagger=minimum,
-        stagger=stagger,
-        clamped=clamped,
-        pool_per_launch=pool,
-        rallies_by_capacity=rallies_by_capacity,
+        pool=pool,
+        rallies_by_cap=rallies_by_cap,
         rallies_by_march_size=rallies_by_march_size,
-        rallies_per_launch=rallies_per_launch,
-        troops_per_player_per_rally=troops_per_player_per_rally,
-        troops_per_rally=troops_per_rally,
+        rallies_per_hit=rallies_per_hit,
+        hosts_used_per_hit=hosts_used_per_hit,
+        unused_hosts_in_active_wave=unused_hosts,
+        active_wave_shortfall=active_wave_shortfall,
+        natural_stagger=natural_stagger,
+        requested_stagger=requested_stagger,
+        min_stagger=min_stagger,
+        stagger=stagger,
+        spacing_increased=spacing_increased,
+        catch_buffer=catch_buffer,
+        overlapping_waves=overlapping_waves,
+        peak_open_rallies=peak_open_rallies,
+        peak_host_shortfall=peak_host_shortfall,
+        avg_per_rally=avg_per_rally,
+        avg_player_per_rally=avg_player_per_rally,
         fill_pct=fill_pct,
-        concurrent_rallies=concurrent,
-        host_shortfall=host_shortfall,
-        feasible_hosts=feasible_hosts,
-        feasible_timing=feasible_timing,
-        wait_after_join_logistics=wait_after_join,
         launches=launches,
-        total_launches=total_launches,
-        total_rallies=total_rallies,
-        total_troops_sent=total_troops_sent,
-        first_hit=first_hit,
-        last_hit=last_hit,
+        total_hits=len(launches),
+        total_rallies=len(launches) * rallies_per_hit,
+        total_troops=len(launches) * pool,
     )
 
 
-def plan_for_waves(waves: int, base_kwargs: dict) -> Plan:
-    kwargs = dict(base_kwargs)
-    kwargs["waves"] = waves
-    kwargs["custom_stagger"] = None
-    return compute_plan(**kwargs)
+def css() -> None:
+    st.markdown("""
+    <style>
+    :root{
+      --bg:#070b12; --panel:#111a29; --line:rgba(255,255,255,.10);
+      --ink:#edf5ff; --muted:#9aaaBF; --gold:#ffbc58; --blue:#58c7ff;
+      --purple:#b990ff; --green:#55e6a5; --red:#ff6470;
+    }
+    .stApp{
+      background:
+        radial-gradient(900px 360px at 15% -8%, rgba(88,199,255,.20), transparent 60%),
+        radial-gradient(760px 360px at 90% 0%, rgba(255,188,88,.18), transparent 62%),
+        radial-gradient(780px 500px at 45% 112%, rgba(185,144,255,.12), transparent 62%),
+        linear-gradient(180deg,#0b1020,#070b12 45%,#050810);
+      color:var(--ink);
+    }
+    .block-container{max-width:1240px;padding-top:1.1rem;}
+    section[data-testid="stSidebar"]{background:linear-gradient(180deg,#111a29,#070b12);border-right:1px solid var(--line);}
+    h1,h2,h3{letter-spacing:.2px;}
+    .hero{
+      border:1px solid var(--line); border-radius:28px; padding:24px 28px; margin-bottom:18px;
+      background:linear-gradient(135deg,rgba(255,188,88,.18),rgba(88,199,255,.12),rgba(185,144,255,.16)),rgba(17,26,41,.80);
+      box-shadow:0 18px 70px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.05);
+    }
+    .kicker{color:var(--gold);font-family:monospace;font-weight:800;text-transform:uppercase;letter-spacing:.15em;font-size:.82rem;}
+    .title{font-size:2.55rem;font-weight:900;line-height:1.05;margin:.25rem 0;}
+    .byline{color:var(--muted);font-family:monospace;font-size:.95rem;}
+    .copy{color:#cbd7e8;margin-top:.7rem;max-width:850px;}
+    .card{background:rgba(17,26,41,.84);border:1px solid var(--line);border-radius:20px;padding:16px 18px;margin:12px 0;box-shadow:0 12px 40px rgba(0,0,0,.22);}
+    .pill{display:inline-block;padding:5px 10px;margin:3px 5px 3px 0;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.055);font-family:monospace;font-size:.84rem;color:#dce8f8;}
+    div[data-testid="stMetric"]{background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.025));border:1px solid var(--line);border-radius:18px;padding:14px 15px;}
+    div[data-testid="stMetricLabel"]{color:#aab8cc;}
+    .footer{text-align:center;color:var(--muted);font-family:monospace;font-size:.84rem;margin:22px 0 8px;}
+    </style>
+    """, unsafe_allow_html=True)
 
 
-# -----------------------------------------------------------------------------
-# UI styling
-# -----------------------------------------------------------------------------
-
-def inject_css() -> None:
-    st.markdown(
-        """
-        <style>
-        .stApp { background: #0a0e15; color: #e9eef6; }
-        .block-container { max-width: 1200px; padding-top: 1.2rem; }
-        div[data-testid="stMetric"] {
-            background: #121a28;
-            border: 1px solid rgba(255,255,255,.08);
-            border-radius: 14px;
-            padding: 12px 14px;
-        }
-        .panel {
-            background: #121a28;
-            border: 1px solid rgba(255,255,255,.08);
-            border-radius: 16px;
-            padding: 16px 18px;
-            margin: 10px 0 16px 0;
-        }
-        .good { color: #4fe0a0; font-weight: 700; }
-        .bad { color: #ff5d62; font-weight: 700; }
-        .info { color: #ffc061; font-weight: 700; }
-        .small { color: #9aa8ba; font-size: .92rem; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-inject_css()
-
-# -----------------------------------------------------------------------------
-# Sidebar inputs
-# -----------------------------------------------------------------------------
-
-st.title("King Shot — Bear Trap Rally Planner")
-st.caption(
-    "Plans waves, rally count, host count, and catch timing. The planner checks that the logistics equations are true before calling a plan feasible."
-)
+css()
 
 with st.sidebar:
-    st.header("Battle setup")
-
+    st.markdown("### Battle setup")
     players = st.slider("Players joining", 3, 100, 10, 1)
-    troops_k = st.slider("Troops each player wants to send per launch (K)", 20, 2_000, 200, 10)
-    march_size_k = st.slider("Player march size / max troops per rally (K)", 20, 1_000, 100, 10)
-    rally_cap_k = st.slider("Rally capacity per host (K)", 100, 6_000, 1_000, 50)
-    hosts_available = st.slider("Available rally hosts/leaders", 1, 50, 10, 1)
-
-    st.header("Timing")
     waves = st.slider("Waves", 1, 4, 2, 1)
-    bear_march = st.slider("March to bear, one way (seconds)", 1, 120, 10, 1)
-    join_host = st.slider("Average time to reach rally host (seconds)", 0, 60, 10, 1)
-    tap_buffer = st.slider("Join/tap buffer (seconds)", 0, 60, 5, 1)
+    hosts_total = st.slider("Total rally hosts/leaders", 1, 80, 10, 1)
 
-    use_custom = st.checkbox("Use custom launch spacing", value=False)
+    st.markdown("### Troops and caps")
+    troop_each_k = st.slider("Troops each player sends per hit (K)", 20, 2_000, 200, 10)
+    march_size_k = st.slider("Player march size / max per rally (K)", 20, 1_000, 200, 10)
+    rally_cap_k = st.slider("Rally cap per host (K)", 100, 6_000, 500, 50)
+
+    st.markdown("### Timing")
+    march_to_bear = st.slider("March to bear, one way (seconds)", 1, 120, 10, 1)
+    reach_host = st.slider("Average time to reach rally host (seconds)", 0, 90, 10, 1)
+    tap_buffer = st.slider("Join/tap safety buffer (seconds)", 0, 90, 5, 1)
+
+    custom_on = st.checkbox("Custom launch spacing", value=False)
     custom_stagger = None
-    if use_custom:
-        custom_stagger = st.slider("Custom launch spacing (seconds)", 30, 300, int(FILL / waves), 5)
+    if custom_on:
+        custom_stagger = st.slider("Launch spacing (seconds)", 30, 300, int(FILL / waves), 5)
 
-base_kwargs = {
-    "players": players,
-    "troops_per_player": troops_k * 1000,
-    "march_size": march_size_k * 1000,
-    "rally_cap": rally_cap_k * 1000,
-    "hosts_available": hosts_available,
-    "waves": waves,
-    "bear_march": bear_march,
-    "join_host": join_host,
-    "tap_buffer": tap_buffer,
-    "custom_stagger": custom_stagger,
-}
-plan = compute_plan(**base_kwargs)
-
-# -----------------------------------------------------------------------------
-# Main metrics
-# -----------------------------------------------------------------------------
-
-st.subheader("Selected plan")
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Hits", plan.total_launches)
-c2.metric("Rallies per launch", plan.rallies_per_launch)
-c3.metric("Concurrent rallies open", plan.concurrent_rallies)
-c4.metric("Total rallies", plan.total_rallies)
-
-c5, c6, c7, c8 = st.columns(4)
-c5.metric("Launch spacing", fmt_clock(plan.stagger))
-c6.metric("Troops per launch", fmt_troops(plan.pool_per_launch))
-c7.metric("Troops per player per rally", fmt_troops(plan.troops_per_player_per_rally))
-c8.metric("Rally fill", pct(plan.fill_pct))
-
-# -----------------------------------------------------------------------------
-# Logistics checks
-# -----------------------------------------------------------------------------
-
-st.subheader("Logistics checks")
-
-checks = []
-checks.append(
-    {
-        "Check": "Rally capacity",
-        "Equation": f"ceil({fmt_troops(plan.pool_per_launch)} / {fmt_troops(plan.rally_cap)})",
-        "Required rallies": plan.rallies_by_capacity,
-        "Status": "OK",
-    }
-)
-checks.append(
-    {
-        "Check": "Player march size",
-        "Equation": f"ceil({fmt_troops(plan.troops_per_player)} / {fmt_troops(plan.march_size)})",
-        "Required rallies": plan.rallies_by_march_size,
-        "Status": "OK",
-    }
-)
-checks.append(
-    {
-        "Check": "Hosts/leaders",
-        "Equation": f"{plan.waves} waves × {plan.rallies_per_launch} rallies per launch",
-        "Required rallies": plan.concurrent_rallies,
-        "Status": "OK" if plan.feasible_hosts else f"Short {plan.host_shortfall}",
-    }
-)
-checks.append(
-    {
-        "Check": "Catch next wave",
-        "Equation": f"stagger {fmt_clock(plan.stagger)} ≥ 2×{bear_march}s + {join_host}s + {tap_buffer}s = {fmt_clock(plan.min_stagger)}",
-        "Required rallies": "—",
-        "Status": "OK" if not plan.clamped else "Spacing auto-increased",
-    }
+plan = compute_plan(
+    players=players,
+    waves=waves,
+    hosts_total=hosts_total,
+    troop_each=troop_each_k * 1000,
+    march_size=march_size_k * 1000,
+    rally_cap=rally_cap_k * 1000,
+    march_to_bear=march_to_bear,
+    reach_host=reach_host,
+    tap_buffer=tap_buffer,
+    custom_stagger=custom_stagger,
 )
 
-st.dataframe(pd.DataFrame(checks), hide_index=True, use_container_width=True)
+st.markdown("""
+<div class="hero">
+  <div class="kicker">King Shot Planner</div>
+  <div class="title">Bear Trap Rally Planner</div>
+  <div class="byline">Author: Dr. D. #2041</div>
+  <div class="copy">Plan clean waves, calculate the exact rallies needed for each hit, avoid empty rallies, and check whether players can catch the next wave.</div>
+</div>
+""", unsafe_allow_html=True)
 
-if not plan.feasible_hosts:
-    st.error(
-        f"Not enough hosts. This setup needs {plan.concurrent_rallies} rallies open at the same time, "
-        f"but you only have {hosts_available}. Add {plan.host_shortfall} host(s), reduce waves, or reduce rallies per launch."
-    )
+st.subheader("Plan snapshot")
+cols = st.columns(4)
+cols[0].metric("Hits in window", plan.total_hits)
+cols[1].metric("Rallies per hit", plan.rallies_per_hit)
+cols[2].metric("Hosts used / active wave", plan.hosts_used_per_hit)
+cols[3].metric("Total rallies opened", plan.total_rallies)
+
+cols = st.columns(4)
+cols[0].metric("Troop pool / hit", fmt_troops(plan.pool))
+cols[1].metric("Avg troops / rally", fmt_troops(plan.avg_per_rally))
+cols[2].metric("Launch spacing", fmt_clock(plan.stagger))
+cols[3].metric("Rally fill", pct(plan.fill_pct))
+
+st.markdown(f"""
+<div class="card">
+  <span class="pill">{plan.players} players</span>
+  <span class="pill">{plan.waves} waves</span>
+  <span class="pill">{plan.hosts_total} total hosts</span>
+  <span class="pill">{plan.hosts_per_wave} hosts per wave</span>
+  <span class="pill">{fmt_troops(plan.rally_cap)} rally cap</span>
+  <span class="pill">{fmt_troops(plan.troop_each)} troops/player/hit</span>
+</div>
+""", unsafe_allow_html=True)
+
+st.subheader("Logistics equations")
+checks = pd.DataFrame([
+    {"Check":"Troop pool per hit", "Equation":f"{players} players × {fmt_troops(plan.troop_each)}", "Result":fmt_troops(plan.pool), "Status":"OK"},
+    {"Check":"Rallies from rally cap", "Equation":f"ceil({fmt_troops(plan.pool)} / {fmt_troops(plan.rally_cap)})", "Result":plan.rallies_by_cap, "Status":"OK"},
+    {"Check":"Rallies from player march size", "Equation":f"ceil({fmt_troops(plan.troop_each)} / {fmt_troops(plan.march_size)})", "Result":plan.rallies_by_march_size, "Status":"OK"},
+    {"Check":"Rallies opened per hit", "Equation":"max(cap requirement, march-size requirement)", "Result":plan.rallies_per_hit, "Status":"No empty rallies"},
+    {"Check":"Hosts in active wave", "Equation":f"{plan.rallies_per_hit} rallies needed ≤ {plan.hosts_per_wave} hosts in that wave", "Result":plan.hosts_used_per_hit, "Status":"OK" if plan.active_wave_shortfall == 0 else f"Short {plan.active_wave_shortfall}"},
+    {"Check":"Catch next wave", "Equation":f"{fmt_clock(plan.stagger)} ≥ 2×{march_to_bear}s + {reach_host}s + {tap_buffer}s", "Result":fmt_clock(plan.min_stagger), "Status":"OK" if not plan.spacing_increased else "Spacing increased"},
+])
+st.dataframe(checks, hide_index=True, use_container_width=True)
+
+if plan.active_wave_shortfall:
+    st.error(f"Host issue: each active wave needs {plan.rallies_per_hit} rallies, but only {plan.hosts_per_wave} hosts are assigned per wave. Short {plan.active_wave_shortfall} per wave.")
+elif plan.unused_hosts_in_active_wave:
+    st.success(f"No empty rallies: the active wave has {plan.hosts_per_wave} hosts available, but only {plan.rallies_per_hit} rallies are needed. {plan.unused_hosts_in_active_wave} host(s) stay unused for that hit.")
 else:
-    st.success(f"Host check passes: {hosts_available} host(s) available for {plan.concurrent_rallies} concurrent rallies.")
+    st.success("Host check passes: active-wave hosts match the rallies needed.")
 
-if plan.clamped:
-    st.warning(
-        f"Requested spacing was {fmt_clock(plan.requested_stagger)}, but the catch equation needs at least "
-        f"{fmt_clock(plan.min_stagger)}. The planner increased spacing to {fmt_clock(plan.stagger)}."
-    )
+if plan.spacing_increased:
+    st.warning(f"Spacing was increased from {fmt_clock(plan.requested_stagger)} to {fmt_clock(plan.stagger)} so players can return, reach the next host, and join.")
 else:
-    st.success(
-        f"Timing check passes. After march back and reaching the next host, players have about "
-        f"{fmt_clock(plan.wait_after_join_logistics)} of extra buffer."
-    )
+    st.success(f"Catch timing passes. Extra catch buffer is about {fmt_clock(plan.catch_buffer)}.")
 
-if plan.troops_per_player_per_rally > plan.march_size + 1e-9:
-    st.error("Player march-size check failed. Increase rallies per launch or reduce troops per player.")
-elif plan.troops_per_rally > plan.rally_cap + 1e-9:
-    st.error("Rally-cap check failed. Increase rallies per launch or reduce troop pool.")
+if plan.peak_host_shortfall:
+    st.warning(f"Overlap note: because rallies stay open for 5:00, up to {plan.overlapping_waves} wave slot(s) may overlap. Peak open rallies can reach {plan.peak_open_rallies}; total hosts are short by {plan.peak_host_shortfall} if all overlapping rallies need separate hosts.")
 else:
-    st.info(
-        f"Each player sends about {fmt_troops(plan.troops_per_player_per_rally)} into each rally. "
-        f"Each rally carries about {fmt_troops(plan.troops_per_rally)} of {fmt_troops(plan.rally_cap)} capacity."
-    )
+    st.info(f"Overlap check passes: peak open rallies are about {plan.peak_open_rallies}, covered by {plan.hosts_total} total hosts.")
 
-# -----------------------------------------------------------------------------
-# Comparison table
-# -----------------------------------------------------------------------------
+if players == 10 and waves == 2 and hosts_total == 10 and troop_each_k == 200 and rally_cap_k == 500:
+    st.markdown("""
+    <div class="card">
+      <b>Example check:</b> 10 players × 200K = 2,000K troops. With a 500K rally cap, the planner opens exactly <b>4 rallies</b> per hit. Since there are 5 hosts in the active wave, 1 host stays unused. No empty rally is opened.
+    </div>
+    """, unsafe_allow_html=True)
 
-st.subheader("1 vs 2 vs 3 vs 4 waves")
-
+st.subheader("Wave comparison")
 comparison = []
 for w in range(1, 5):
-    p = plan_for_waves(w, base_kwargs)
-    comparison.append(
-        {
-            "Waves": w,
-            "Hits": p.total_launches,
-            "Launch spacing": fmt_clock(p.stagger),
-            "Rallies / launch": p.rallies_per_launch,
-            "Concurrent rallies": p.concurrent_rallies,
-            "Hosts needed": p.concurrent_rallies,
-            "Host status": "OK" if p.feasible_hosts else f"Short {p.host_shortfall}",
-            "Timing status": "OK" if not p.clamped else "Auto-spaced",
-            "Total troops sent": fmt_troops(p.total_troops_sent),
-        }
-    )
-
+    p = compute_plan(players, w, hosts_total, troop_each_k * 1000, march_size_k * 1000, rally_cap_k * 1000, march_to_bear, reach_host, tap_buffer, None)
+    comparison.append({
+        "Waves": w,
+        "Hits": p.total_hits,
+        "Spacing": fmt_clock(p.stagger),
+        "Hosts / wave": p.hosts_per_wave,
+        "Rallies / hit": p.rallies_per_hit,
+        "Unused hosts / active wave": p.unused_hosts_in_active_wave,
+        "Peak open rallies": p.peak_open_rallies,
+        "Host status": "OK" if p.active_wave_shortfall == 0 else f"Short {p.active_wave_shortfall}/wave",
+        "Total troops sent": fmt_troops(p.total_troops),
+    })
 st.dataframe(pd.DataFrame(comparison), hide_index=True, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# Launch schedule
-# -----------------------------------------------------------------------------
+st.subheader("Hit schedule — rallies shown for every wave hit")
+st.dataframe(pd.DataFrame(plan.launches), hide_index=True, use_container_width=True, height=460)
 
-st.subheader("Launch schedule")
+st.subheader("Per-wave view")
+tabs = st.tabs([f"Wave {i}" for i in range(1, plan.waves + 1)])
+for wave_no, tab in enumerate(tabs, 1):
+    with tab:
+        rows = [r for r in plan.launches if r["Wave"] == wave_no]
+        st.caption(f"Wave {wave_no}: {len(rows)} hit(s). Each hit opens {plan.rallies_per_hit} rally/rallies, not every available host slot.")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
-schedule_rows = []
-for launch in plan.launches:
-    schedule_rows.append(
-        {
-            "#": launch["idx"],
-            "Wave": launch["lane"] + 1,
-            "Open at trap time left": fmt_left(launch["open"]),
-            "Depart at": fmt_left(launch["depart"]),
-            "Hit at": fmt_left(launch["hit"]),
-            "Return at": fmt_left(launch["return"]),
-            "Rallies opened": launch["rallies"],
-            "Troops sent": fmt_troops(launch["troops"]),
-            "Final allowed open": "Yes" if launch["final"] else "",
-        }
-    )
+st.markdown(f"""
+<div class="card">
+  <b>Planner rule:</b> rallies per hit = max(ceil(total troop pool / rally cap), ceil(troops per player / player march size)).<br><br>
+  Current math: max(ceil({fmt_troops(plan.pool)} / {fmt_troops(plan.rally_cap)}), ceil({fmt_troops(plan.troop_each)} / {fmt_troops(plan.march_size)})) = <b>{plan.rallies_per_hit}</b> rally/rallies per hit.
+</div>
+""", unsafe_allow_html=True)
 
-st.dataframe(pd.DataFrame(schedule_rows), hide_index=True, use_container_width=True, height=460)
-
-# -----------------------------------------------------------------------------
-# Explanation
-# -----------------------------------------------------------------------------
-
-st.markdown(
-    f"""
-    <div class="panel">
-    <b>How to read this:</b><br>
-    This setup has <b>{players}</b> players. Each player is trying to send <b>{fmt_troops(plan.troops_per_player)}</b>
-    per launch, but each march can carry only <b>{fmt_troops(plan.march_size)}</b>. Therefore the launch needs at least
-    <b>{plan.rallies_by_march_size}</b> rally/rallies for the player march-size constraint. The total pool is
-    <b>{fmt_troops(plan.pool_per_launch)}</b>, so rally capacity requires <b>{plan.rallies_by_capacity}</b> rally/rallies.
-    The planner uses the higher number: <b>{plan.rallies_per_launch}</b> rally/rallies per launch.<br><br>
-    With <b>{plan.waves}</b> wave(s), that means <b>{plan.concurrent_rallies}</b> rallies need to be open at once.
-    The catch timing equation is <b>launch spacing ≥ 2 × bear march + time to reach host + buffer</b>.
-    Here, that is <b>{fmt_clock(plan.stagger)} ≥ {fmt_clock(plan.min_stagger)}</b>.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.caption(
-    "This planner estimates timing, rallies, and troop flow. It does not estimate damage, which depends on heroes, buffs, lethality, and other game factors."
-)
+st.markdown('<div class="footer">Bear Trap Rally Planner | Author: Dr. D. #2041 | timing planner only, not damage calculator</div>', unsafe_allow_html=True)
