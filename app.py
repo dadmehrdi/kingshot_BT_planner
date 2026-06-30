@@ -1,7 +1,7 @@
 
 """
 King Shot — Bear Trap Rally Planner
-Author: Dr. D. #2041
+Author: DrD #2041
 
 requirements.txt:
 streamlit
