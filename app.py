@@ -144,6 +144,7 @@ def simulate(players, avg, cap, trap_travel, join_travel, buffer, waves, stagger
         "waves": waves, "hosts_short": rallies_per_wave < needed,
         "marches_per_player": marches_per_player, "marches_per_rally": marches_per_rally,
         "total_marches": round(total_troops / march_size), "march_size": march_size,
+        "scheduled": len(launches), "missed": len(launches) - len(live),
     }
 
 
@@ -309,7 +310,8 @@ with st.sidebar:
     st.markdown("**March times**")
     c1, c2 = st.columns(2)
     trap_travel = c1.number_input("To bear (s)", 5, 300, 10, 1,
-                                  help="One-way march from a host's city to the bear.")
+                                  help="One-way march from a host's city to the bear. Counted twice "
+                                       "(out + back) in the march loop.")
     join_travel = c2.number_input("To host (s)", 0, 300, 10, 1,
                                   help="March to reach the host when you JOIN a rally.")
     buffer = st.number_input("Tap buffer (s)", 0, 60, 5, 1,
@@ -407,9 +409,12 @@ if plan["hosts_short"]:
                               f'({fmt_troops(short_cap)} of room). The overflow waits for the next launch — '
                               f'fewer waves or a bigger cap fixes it.'))
 if not plan["catch_ok"] and plan["rallies_per_wave"] > 0:
+    miss = plan["missed"]
     warns.append(("bad", "!", f'Tight catch: launches are {fmt_clock(plan["stagger"])} apart but the march '
-                              f'loop is {fmt_clock(plan["loop"])}, so troops miss some rallies and they leave '
-                              f'~{round(plan["avg_fill"]*100)}% full. Widen the stagger or shorten marches.'))
+                              f'loop is {fmt_clock(plan["loop"])} (2×{trap_travel}s to bear + {join_travel}s to '
+                              f'host + {buffer}s), so troops can\'t get back and re-join in time. '
+                              f'{miss} of {plan["scheduled"]} launches go out empty and the rest sit '
+                              f'~{round(plan["avg_fill"]*100)}% full. Widen the stagger (fewer waves) or shorten marches.'))
 elif plan["catch_ok"] and plan["rallies_per_wave"] > 0 and waves > 1:
     warns.append(("good", "+", f'Returning troops reach the next host in time — every rally fills '
                                f'(~{round(plan["avg_fill"]*100)}%).'))
