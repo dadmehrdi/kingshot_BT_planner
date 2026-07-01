@@ -79,9 +79,11 @@ def march_loop(trap_travel, join_travel, buffer):
     return 2 * trap_travel + join_travel + buffer
 
 
-def simulate(players, avg, cap, trap_travel, join_travel, buffer, waves, stagger):
+def simulate(players, avg, cap, trap_travel, join_travel, buffer, waves, stagger, march_size):
     pool = players * avg
     needed = max(1, math.ceil(pool / cap))
+    marches_per_player = max(1, math.ceil(avg / march_size))   # how many rallies one player sends into
+    marches_per_rally = max(1, round(cap / march_size))        # sends it takes to fill a rally
     hosts_avail = players // waves                       # equal hosts per wave
     rallies_per_wave = min(needed, hosts_avail) if hosts_avail > 0 else 0
     capacity = rallies_per_wave * cap                    # troops one wave can hold per launch
@@ -118,6 +120,7 @@ def simulate(players, avg, cap, trap_travel, join_travel, buffer, waves, stagger
             "lane": lane, "open": open_t, "depart": depart,
             "hit": depart + trap_travel, "ret": depart + 2 * trap_travel,
             "troops": troops_in, "players": used, "rallies": rallies_used,
+            "marches": round(troops_in / march_size),
             "fill": (troops_in / capacity) if capacity > 0 else 0,
             "final": open_t >= LAST_LAUNCH - stagger + 1,
         })
@@ -139,6 +142,8 @@ def simulate(players, avg, cap, trap_travel, join_travel, buffer, waves, stagger
         "total_rallies": total_rallies, "total_launches": total_launches,
         "first_hit": first_hit, "last_hit": last_hit, "avg_fill": avg_fill,
         "waves": waves, "hosts_short": rallies_per_wave < needed,
+        "marches_per_player": marches_per_player, "marches_per_rally": marches_per_rally,
+        "total_marches": round(total_troops / march_size), "march_size": march_size,
     }
 
 
@@ -282,6 +287,7 @@ inject_css()
 st.markdown(
     '<div class="hero"><div class="eyebrow">King Shot &middot; Bear Hunt</div>'
     '<h1>Bear Trap Rally Planner</h1>'
+    '<div style="font-family:var(--mono);font-size:11px;letter-spacing:.15em;color:var(--ember2);margin:2px 0 6px;">By DrD #2041</div>'
     '<p>The whole 30:00 is simulated launch by launch. The rally cap sets how many hosts each wave '
     'needs; the two march times decide whether returning troops catch the next rally before it leaves.</p></div>',
     unsafe_allow_html=True,
@@ -290,9 +296,14 @@ st.markdown(
 with st.sidebar:
     st.markdown('<div class="ctitle">Battle setup</div>', unsafe_allow_html=True)
     num_players = st.slider("Players in the event", 3, 100, 10, 1)
-    avg_k = st.slider("Avg troops each player sends (K)", 20, 2000, 200, 10)
+    avg_k = st.slider("Avg troops per player — total (K)", 20, 2000, 200, 10,
+                      help="How many troops one player has to send in total.")
+    march_k = st.slider("Avg march size — per send (K)", 10, 2000, 100, 10,
+                        help="Troops in a single rally-join. A player with more than this splits "
+                             "into several marches across rallies (e.g. 300K ÷ 100K = 3 sends).")
     cap_k = st.slider("Rally capacity — a full rally (K)", 100, 6000, 500, 50)
     avg = avg_k * 1000
+    march_size = march_k * 1000
     cap = cap_k * 1000
 
     st.markdown("**March times**")
@@ -317,13 +328,13 @@ with st.sidebar:
     st.caption(f"March loop = 2×{trap_travel}s + {join_travel}s + {buffer}s = **{fmt_clock(loop)}**. "
                f"Hosts available per wave = {num_players} ÷ {waves} = **{num_players // waves}**.")
 
-plan = simulate(num_players, avg, cap, trap_travel, join_travel, buffer, waves, stagger)
+plan = simulate(num_players, avg, cap, trap_travel, join_travel, buffer, waves, stagger, march_size)
 
 # ---- comparison 1/2/3 (each at its natural stagger) ----
 st.markdown('<div class="card glow">', unsafe_allow_html=True)
 st.markdown('<div class="ctitle">Compare 1 / 2 / 3 waves</div>', unsafe_allow_html=True)
 sims = {w: simulate(num_players, avg, cap, trap_travel, join_travel, buffer, w,
-                    best_stagger(trap_travel, join_travel, buffer, w)) for w in (1, 2, 3)}
+                    best_stagger(trap_travel, join_travel, buffer, w), march_size) for w in (1, 2, 3)}
 feasible = [w for w in (1, 2, 3) if sims[w]["rallies_per_wave"] > 0]
 best_w = max(feasible, key=lambda w: sims[w]["total_troops"]) if feasible else 1
 cmp_html = '<div class="cmp">'
@@ -359,7 +370,7 @@ st.markdown(
     f'<div class="bignum"><div class="k">Your plan: {waves} wave{"s" if waves>1 else ""}</div>'
     f'<div class="v">{fmt_troops(plan["total_troops"])}</div>'
     f'<div class="s">{plan["total_rallies"]} rally hits &middot; {plan["total_launches"]} launches &middot; '
-    f'{plan["rallies_per_wave"]} hosts per wave</div></div>',
+    f'{plan["rallies_per_wave"]} hosts per wave &middot; {plan["marches_per_player"]} marches/player</div></div>',
     unsafe_allow_html=True,
 )
 fh = fmt_left(plan["first_hit"]) if plan["first_hit"] is not None else "—"
@@ -407,7 +418,9 @@ if trap_travel > 40 or join_travel > 40:
 if plan["rallies_per_wave"] > 0:
     warns.append(("info", "i", f'Each wave opens {plan["rallies_per_wave"]} rally(s) '
                                f'({fmt_troops(plan["pool"])} ÷ {fmt_troops(cap)} cap), and across '
-                               f'{waves} waves that\'s {plan["host_slots"]} hosts out of {num_players} players.'))
+                               f'{waves} waves that\'s {plan["host_slots"]} hosts out of {num_players} players. '
+                               f'Each player sends {plan["marches_per_player"]} march(es) of ~{fmt_troops(march_size)}; '
+                               f'it takes {plan["marches_per_rally"]} to fill one rally.'))
 one = sims[1]
 if waves > 1 and plan["rallies_per_wave"] > 0 and plan["total_troops"] > one["total_troops"] + 1:
     warns.append(("good", "+", f'{waves} waves delivers {fmt_troops(plan["total_troops"]-one["total_troops"])} '
@@ -454,6 +467,7 @@ else:
                     "Hit": fmt_left(cy["hit"]),
                     "Return": fmt_left(cy["ret"]),
                     "Rallies": cy["rallies"],
+                    "Marches": cy["marches"],
                     "Troops": fmt_troops(cy["troops"]),
                     "Fill": f'{round(cy["fill"]*100)}%',
                 })
@@ -464,8 +478,10 @@ else:
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown(
     f'<div class="how"><b>How it\'s simulated.</b> Times are <b>time left on the trap</b>. '
-    f'{fmt_troops(plan["pool"])} of troops ÷ {fmt_troops(cap)} cap = {plan["needed"]} rallies to hold everyone; '
-    f'with {waves} waves you have {num_players // waves} hosts per wave, so each wave opens '
+    f'Each player has <b>{fmt_troops(avg)}</b> total but sends it <b>{fmt_troops(march_size)}</b> at a time, so '
+    f'{plan["marches_per_player"]} march(es) each; a {fmt_troops(cap)} rally takes {plan["marches_per_rally"]} of '
+    f'those to fill. {fmt_troops(plan["pool"])} of troops ÷ {fmt_troops(cap)} cap = {plan["needed"]} rallies to hold '
+    f'everyone; with {waves} waves you have {num_players // waves} hosts per wave, so each wave opens '
     f'<b>{plan["rallies_per_wave"]}</b>. A rally fills 5:00, departs, marches <code>{trap_travel}s</code> to '
     f'the bear (<b>hit</b>) and back. The clock is walked launch by launch: when troops return they march '
     f'<code>{join_travel}s</code> to the next host and join if they arrive before it leaves — otherwise they '
